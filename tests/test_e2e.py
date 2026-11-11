@@ -127,3 +127,315 @@ def test_bad_list_url_returns_502(client):
 
 def test_healthz(client):
     assert client.get("/healthz").json() == {"status": "ok"}
+
+
+# --------------------------------------------------------------------------- #
+# 故障佐证 API
+# --------------------------------------------------------------------------- #
+def _evidence(client, list_url, code, outage_path, receipts):
+    resp = client.post(
+        "/api/v1/fault-evidence",
+        json={
+            "list_url": list_url,
+            "project_code": code,
+            "outage_dir_url": outage_path,
+            "receipts": receipts,
+            "timeout": 5,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+def _outage_url(static_server: str, path: str) -> str:
+    return static_server.replace("/list.html", path)
+
+
+def test_fault_evidence_supported_after_errata_extends_outage(client, static_server):
+    data = _evidence(
+        client,
+        static_server,
+        "GSB-2026-001",
+        _outage_url(static_server, "/outage/list.html"),
+        [
+            {
+                "receipt_no": "RCPT-001",
+                "outcome": "failed",
+                "occurred_at": "2026-11-12T12:15:00+08:00",
+            }
+        ],
+    )
+
+    assert data["verdict"] == "supported"
+    assert data["status"] == "supported"
+    assert data["verdict_label"] == "可佐证"
+    assert data["appeal_basis"] is True
+    # 原公告 12:00 结束，勘误延长到 12:30，因此 12:15 的失败尝试可佐证
+    assert data["supported_attempts"][0]["receipt_no"] == "RCPT-001"
+    assert data["supported_attempts"][0]["outage_end"].startswith("2026-11-12T12:30:00")
+    assert data["supported_attempts"][0]["errata_ids"] == ["ERR-2026-1112-01"]
+    assert any("err" in s["url"] for s in data["sources"] if s["role"] == "outage-errata")
+
+
+def test_fault_evidence_accepted_when_success_before_deadline(client, static_server):
+    data = _evidence(
+        client,
+        static_server,
+        "GSB-2026-001",
+        _outage_url(static_server, "/outage/list.html"),
+        [
+            {
+                "receipt_no": "RCPT-FAIL",
+                "outcome": "failed",
+                "occurred_at": "2026-11-12T12:15:00+08:00",
+            },
+            {
+                "receipt_no": "RCPT-OK",
+                "outcome": "accepted",
+                "occurred_at": "2026-11-13T10:00:00+08:00",
+            },
+        ],
+    )
+
+    assert data["verdict"] == "accepted"
+    assert data["verdict_label"] == "已受理"
+    assert data["already_accepted"] is True
+    assert data["appeal_basis"] is False
+    assert data["accepted_receipt"]["receipt_no"] == "RCPT-OK"
+    assert data["supported_attempts"] == []
+
+
+def test_fault_evidence_ignores_success_after_deadline(client, static_server):
+    data = _evidence(
+        client,
+        static_server,
+        "GSB-2026-001",
+        _outage_url(static_server, "/outage/list.html"),
+        [
+            {
+                "receipt_no": "RCPT-FAIL",
+                "outcome": "failed",
+                "occurred_at": "2026-11-12T12:15:00+08:00",
+            },
+            {
+                "receipt_no": "RCPT-LATE",
+                "outcome": "accepted",
+                "occurred_at": "2026-11-15T15:00:00+08:00",
+            },
+        ],
+    )
+
+    assert data["verdict"] == "supported"
+    assert data["already_accepted"] is False
+    assert [a["receipt_no"] for a in data["supported_attempts"]] == ["RCPT-FAIL"]
+    assert any("截标后" in w for w in data["warnings"])
+
+
+def test_fault_evidence_understands_timezone_aware_receipts(client, static_server):
+    # 04:15Z == 12:15+08:00，落在故障时段内
+    data = _evidence(
+        client,
+        static_server,
+        "GSB-2026-001",
+        _outage_url(static_server, "/outage/list.html"),
+        [
+            {
+                "receipt_no": "RCPT-UTC",
+                "outcome": "failed",
+                "occurred_at": "2026-11-12T04:15:00Z",
+            }
+        ],
+    )
+    assert data["verdict"] == "supported"
+    assert data["supported_attempts"][0]["occurred_at"].startswith("2026-11-12T04:15:00")
+
+
+def test_fault_evidence_no_evidence_when_attempt_outside_window(client, static_server):
+    data = _evidence(
+        client,
+        static_server,
+        "GSB-2026-001",
+        _outage_url(static_server, "/outage/list.html"),
+        [
+            {
+                "receipt_no": "RCPT-OUTSIDE",
+                "outcome": "failed",
+                "occurred_at": "2026-11-12T12:45:00+08:00",
+            }
+        ],
+    )
+    assert data["verdict"] == "no_evidence"
+    assert data["verdict_label"] == "无申诉依据"
+    assert data["appeal_basis"] is False
+
+
+def test_fault_evidence_project_without_outage_has_no_evidence(client, static_server):
+    data = _evidence(
+        client,
+        static_server,
+        "GSB-2026-099",
+        _outage_url(static_server, "/outage/list.html"),
+        [
+            {
+                "receipt_no": "RCPT-099",
+                "outcome": "failed",
+                "occurred_at": "2026-11-12T12:15:00+08:00",
+            }
+        ],
+    )
+    assert data["verdict"] == "no_evidence"
+    assert data["reason_codes"] == ["no_outage_window_for_project"]
+
+
+def test_fault_evidence_pending_deadline_is_undeterminable(client, static_server):
+    data = _evidence(
+        client,
+        static_server,
+        "GSB-2026-003",
+        _outage_url(static_server, "/outage/list.html"),
+        [
+            {
+                "receipt_no": "RCPT-003",
+                "outcome": "failed",
+                "occurred_at": "2026-11-08T22:00:00+08:00",
+            }
+        ],
+    )
+    assert data["verdict"] == "unable_to_determine"
+    assert data["verdict_label"] == "无法判定"
+    assert data["effective_deadline"] is None
+    assert data["reason_codes"] == ["deadline_pending"]
+
+
+def test_fault_evidence_cancelled_project_is_undeterminable(client, static_server):
+    data = _evidence(
+        client,
+        static_server,
+        "GSB-2026-002",
+        _outage_url(static_server, "/outage/list.html"),
+        [
+            {
+                "receipt_no": "RCPT-002",
+                "outcome": "failed",
+                "occurred_at": "2026-11-04T11:00:00+08:00",
+            }
+        ],
+    )
+    assert data["verdict"] == "unable_to_determine"
+    assert data["effective_deadline"] is None
+
+
+def test_fault_evidence_detail_404_is_undeterminable(client, static_server):
+    data = _evidence(
+        client,
+        static_server,
+        "GSB-2026-001",
+        _outage_url(static_server, "/outage/broken/list.html"),
+        [
+            {
+                "receipt_no": "RCPT-404",
+                "outcome": "failed",
+                "occurred_at": "2026-11-12T12:15:00+08:00",
+            }
+        ],
+    )
+    assert data["verdict"] == "unable_to_determine"
+    assert "outage_detail_fetch_failed" in data["reason_codes"]
+    assert any(s["role"] == "outage-failed" for s in data["sources"])
+
+
+def test_fault_evidence_errata_without_reference_is_undeterminable(client, static_server):
+    data = _evidence(
+        client,
+        static_server,
+        "GSB-2026-001",
+        _outage_url(static_server, "/outage/errata-no-ref/list.html"),
+        [
+            {
+                "receipt_no": "RCPT-ER1",
+                "outcome": "failed",
+                "occurred_at": "2026-11-12T12:15:00+08:00",
+            }
+        ],
+    )
+    assert data["verdict"] == "unable_to_determine"
+    assert "errata_reference_missing" in data["reason_codes"]
+
+
+def test_fault_evidence_dangling_errata_reference_is_undeterminable(client, static_server):
+    data = _evidence(
+        client,
+        static_server,
+        "GSB-2026-001",
+        _outage_url(static_server, "/outage/errata-dangling/list.html"),
+        [
+            {
+                "receipt_no": "RCPT-ER2",
+                "outcome": "failed",
+                "occurred_at": "2026-11-12T12:15:00+08:00",
+            }
+        ],
+    )
+    assert data["verdict"] == "unable_to_determine"
+    assert "errata_reference_missing" in data["reason_codes"]
+    assert any("引用编号不存在" in w for w in data["warnings"])
+
+
+def test_fault_evidence_errata_replaces_affected_project(client, static_server):
+    # 原公告写 GSB-2026-001，勘误替换为 GSB-2026-099
+    data_001 = _evidence(
+        client,
+        static_server,
+        "GSB-2026-001",
+        _outage_url(static_server, "/outage/errata-project/list.html"),
+        [
+            {
+                "receipt_no": "RCPT-001",
+                "outcome": "failed",
+                "occurred_at": "2026-11-12T12:15:00+08:00",
+            }
+        ],
+    )
+    assert data_001["verdict"] == "no_evidence"
+
+    data_099 = _evidence(
+        client,
+        static_server,
+        "GSB-2026-099",
+        _outage_url(static_server, "/outage/errata-project/list.html"),
+        [
+            {
+                "receipt_no": "RCPT-099",
+                "outcome": "failed",
+                "occurred_at": "2026-11-12T12:15:00+08:00",
+            }
+        ],
+    )
+    assert data_099["verdict"] == "supported"
+    assert data_099["supported_attempts"][0]["errata_ids"] == ["ERR-2026-1112-31"]
+
+
+def test_fault_evidence_get_endpoint(client, static_server):
+    import json
+
+    receipts = json.dumps(
+        [
+            {
+                "receipt_no": "RCPT-GET",
+                "outcome": "failed",
+                "occurred_at": "2026-11-12T12:15:00+08:00",
+            }
+        ]
+    )
+    resp = client.get(
+        "/api/v1/fault-evidence",
+        params={
+            "list_url": static_server,
+            "project_code": "GSB-2026-001",
+            "outage_dir_url": _outage_url(static_server, "/outage/list.html"),
+            "receipts": receipts,
+            "timeout": 5,
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["verdict"] == "supported"

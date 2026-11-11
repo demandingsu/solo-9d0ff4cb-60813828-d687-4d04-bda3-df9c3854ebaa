@@ -5,6 +5,11 @@ services:
     container_name: tender-collector-api
     ports:
       - "8000:8000"
+    environment:
+      # 容器内部通过服务名访问示例站点；演示页默认值会同步使用这两个地址
+      SAMPLE_SITE_URL: http://sample-site
+      SAMPLE_LIST_URL: http://sample-site/list.html
+      SAMPLE_OUTAGE_LIST_URL: http://sample-site/outage/list.html
     depends_on:
       sample-site:
         condition: service_healthy
